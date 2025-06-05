@@ -25,6 +25,23 @@ except ImportError:
         return None
 
 
+def ensure_dir(dir_name: str) -> Path:
+    """Ensures a directory exists and is empty of everything except a .gitignore file."""
+    xtime_path = Path.cwd() / dir_name
+    xtime_path.mkdir(exist_ok=True)
+    for item in xtime_path.iterdir():
+        if item.name == ".gitignore":
+            continue
+        if item.is_file() or item.is_symlink():
+            item.unlink()
+        if item.is_dir():
+            shutil.rmtree(item)
+    if not (xtime_path / ".gitignore").exists():
+        with open(xtime_path / ".gitignore", "w") as f:
+            f.write("*")
+    return xtime_path
+
+
 STATUS_ICON_MAP = {
     "passed": "✔",
     "failed": "✘",
@@ -34,7 +51,6 @@ STATUS_ICON_MAP = {
 
 @dataclass
 class TestData:
-    test_name: str
     execution_result: Literal["passed", "failed", "skipped"]
     execution_time: float
 
@@ -46,7 +62,7 @@ class ExecutionTimeTracker:
         self.test_data: dict[str, TestData | float] = {}
         self.show_summary: bool = True
         self.top_count: int = 5
-        self.temp_path: Path | None = None
+        self.json_path: Path | None = None
         self.temp_path: Path | None = None
         self.is_xdist_worker: bool = False
         self.worker_id: str | None = None
@@ -57,18 +73,7 @@ class ExecutionTimeTracker:
         self.json_path = Path(json_path).absolute() if json_path else None
 
         # Create or clean temp directory and create .gitignore file
-        self.temp_path = Path.cwd() / ".xtime"
-        self.temp_path.mkdir(exist_ok=True)
-        for item in self.temp_path.iterdir():
-            if item.name == ".gitignore":
-                continue
-            if item.is_file() or item.is_symlink():
-                item.unlink()
-            if item.is_dir():
-                shutil.rmtree(item)
-        if not (self.temp_path / ".gitignore").exists():
-            with open(self.temp_path / ".gitignore", "w") as f:
-                f.write("*")
+        self.temp_path = ensure_dir(".xtime")
 
         self.show_summary = not config.getoption("xtime_no_summary")
         self.top_count = config.getoption("xtime_top_count")
@@ -91,7 +96,6 @@ class ExecutionTimeTracker:
 
             # Store data for JSON export and summary
             test_data = TestData(
-                test_name=item.nodeid,
                 execution_result=report.outcome,
                 execution_time=execution_time,
             )
@@ -111,7 +115,7 @@ class ExecutionTimeTracker:
 
         if self.test_data and json_path:
             # Convert TestData objects to dictionaries for JSON serialization
-            json_data = [asdict(test) for test in self.test_data.values()]
+            json_data = {k: asdict(v) for k, v in self.test_data.items()}
 
             try:
                 with open(json_path, "w", encoding="utf-8") as f:
@@ -221,22 +225,22 @@ def pytest_terminal_summary(
 
     # Sort tests by execution time (slowest first)
     sorted_tests = sorted(
-        all_test_data.values(), key=lambda x: x.execution_time, reverse=True
+        all_test_data, key=lambda k: all_test_data[k].execution_time, reverse=True
     )
 
+    # Initialize counter values
+    total_time = 0
+    counts = dict.fromkeys(STATUS_ICON_MAP, 0)
+
+    for test in all_test_data.values():
+        total_time += test.execution_time
+        counts[test.execution_result] += 1
+
     # Calculate statistics
-    total_tests = len(sorted_tests)
-    total_time = sum(test.execution_time for test in sorted_tests)
+    total_tests = len(all_test_data)
     avg_time = total_time / total_tests if total_tests > 0 else 0
     slowest_test = sorted_tests[0] if sorted_tests else None
     fastest_test = sorted_tests[-1] if sorted_tests else None
-
-    # Count by status
-    passed_count = sum(1 for test in sorted_tests if test.execution_result == "passed")
-    failed_count = sum(1 for test in sorted_tests if test.execution_result == "failed")
-    skipped_count = sum(
-        1 for test in sorted_tests if test.execution_result == "skipped"
-    )
 
     # Write summary section
     terminalreporter.write_sep("=", "execution time summary", bold=True)
@@ -244,16 +248,16 @@ def pytest_terminal_summary(
     terminalreporter.write_line(f"Total execution time: {total_time:.4f}s")
     terminalreporter.write_line(f"Average execution time: {avg_time:.4f}s")
     terminalreporter.write_line(
-        f"Status breakdown: {passed_count} passed, {failed_count} failed, {skipped_count} skipped"
+        f"Status breakdown: {counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped"
     )
 
     if slowest_test:
         terminalreporter.write_line(
-            f"Slowest test: {slowest_test.test_name} ({slowest_test.execution_time:.4f}s)"
+            f"Slowest test: {slowest_test} ({all_test_data[slowest_test].execution_time:.4f}s)"
         )
     if fastest_test and fastest_test != slowest_test:
         terminalreporter.write_line(
-            f"Fastest test: {fastest_test.test_name} ({fastest_test.execution_time:.4f}s)"
+            f"Fastest test: {fastest_test} ({all_test_data[fastest_test].execution_time:.4f}s)"
         )
 
     if total_tests > 0:
@@ -268,9 +272,10 @@ def pytest_terminal_summary(
         terminalreporter.write_line("")
         terminalreporter.write_line(summary_line)
         for i, test in enumerate(selected_tests, 1):
-            status_icon = STATUS_ICON_MAP[test.execution_result]
+            test_data = all_test_data[test]
+            status_icon = STATUS_ICON_MAP[test_data.execution_result]
             terminalreporter.write_line(
-                f"  {i}. {status_icon} {test.test_name}: {test.execution_time:.4f}s"
+                f"  {i}. {status_icon} {test}: {test_data.execution_time:.4f}s"
             )
 
     terminalreporter.write_line("")  # Add blank line for better readability
